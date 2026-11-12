@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: "Confirm cleanup of old GitHub Pages deployments"
+        description: "Confirm deletion of old inactive GitHub Pages deployments"
         required: true
         type: boolean
         default: false
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Clean old GitHub Pages deployments
+      - name: Delete old inactive Pages deployments only
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -27,57 +27,52 @@ jobs:
           python3 <<'PY'
           import os
           import json
+          import time
           import urllib.request
           import urllib.error
-          import urllib.parse
 
           repo = os.environ["REPOSITORY"]
           token = os.environ["GH_TOKEN"]
 
-          if repo.lower() != "hhtoplk/lakio":
-              raise SystemExit("ERROR: Wrong repository. Cleanup stopped.")
-
           base = f"https://api.github.com/repos/{repo}"
-
           headers = {
               "Authorization": f"Bearer {token}",
               "Accept": "application/vnd.github+json",
               "X-GitHub-Api-Version": "2022-11-28"
           }
 
-          def api(path, method="GET"):
+          def api(url, method="GET"):
               req = urllib.request.Request(
-                  base + path,
+                  url,
                   headers=headers,
                   method=method
               )
               with urllib.request.urlopen(req, timeout=30) as response:
                   body = response.read()
-                  return json.loads(body) if body else None
+                  if not body:
+                      return None
+                  return json.loads(body)
 
-          print("Checking GitHub Pages deployments...")
+          print("Fetching GitHub Pages deployments...")
 
           deployments = []
           page = 1
 
           while True:
-              path = (
-                  "/deployments?"
-                  + urllib.parse.urlencode({
-                      "environment": "github-pages",
-                      "per_page": 100,
-                      "page": page
-                  })
+              url = (
+                  f"{base}/deployments"
+                  f"?environment=github-pages"
+                  f"&per_page=100&page={page}"
               )
 
-              batch = api(path)
+              items = api(url)
 
-              if not batch:
+              if not items:
                   break
 
-              deployments.extend(batch)
+              deployments.extend(items)
 
-              if len(batch) < 100:
+              if len(items) < 100:
                   break
 
               page += 1
@@ -85,80 +80,87 @@ jobs:
           print(f"Total Pages deployments found: {len(deployments)}")
 
           if not deployments:
-              print("Nothing to clean.")
+              print("No deployments found.")
               raise SystemExit(0)
 
-          # Find the newest successful deployment.
-          successful = []
-
-          for deployment in deployments:
-              statuses = api(
-                  f"/deployments/{deployment['id']}/statuses"
-                  "?per_page=1"
-              )
-
-              if statuses and statuses[0].get("state") == "success":
-                  successful.append(deployment)
-
-          if not successful:
-              print("No successful deployment found.")
-              print("Nothing was deleted.")
-              raise SystemExit(0)
-
-          latest = max(
-              successful,
-              key=lambda d: d["created_at"]
-          )
-
-          keep_id = latest["id"]
-
-          print(f"Keeping latest successful deployment: {keep_id}")
+          # Always preserve the newest deployment.
+          newest_id = deployments[0]["id"]
 
           deleted = 0
-          skipped = 0
+          preserved = 0
+          failed = 0
 
-          # Delete only deployments already marked inactive.
           for deployment in deployments:
               deployment_id = deployment["id"]
 
-              if deployment_id == keep_id:
-                  print(f"KEEP latest: {deployment_id}")
+              # Never delete the newest deployment.
+              if deployment_id == newest_id:
+                  print(f"KEEP newest deployment: {deployment_id}")
+                  preserved += 1
                   continue
 
-              statuses = api(
-                  f"/deployments/{deployment_id}/statuses"
-                  "?per_page=1"
+              # Check the latest status of this deployment.
+              status_url = (
+                  f"{base}/deployments/{deployment_id}/statuses"
+                  f"?per_page=1"
               )
 
-              state = statuses[0].get("state") if statuses else None
-
-              if state != "inactive":
-                  print(
-                      f"SKIPPED {deployment_id}: "
-                      f"state is {state or 'unknown'}"
-                  )
-                  skipped += 1
-                  continue
-
               try:
+                  statuses = api(status_url)
+
+                  if not statuses:
+                      print(f"KEEP no status: {deployment_id}")
+                      preserved += 1
+                      continue
+
+                  state = statuses[0].get("state", "").lower()
+
+                  # Delete only deployments explicitly marked inactive.
+                  if state != "inactive":
+                      print(
+                          f"KEEP deployment {deployment_id}: "
+                          f"status={state}"
+                      )
+                      preserved += 1
+                      continue
+
+                  # Recheck status immediately before deletion.
+                  latest = api(status_url)
+
+                  if (
+                      not latest
+                      or latest[0].get("state", "").lower() != "inactive"
+                  ):
+                      print(f"KEEP changed status: {deployment_id}")
+                      preserved += 1
+                      continue
+
                   api(
-                      f"/deployments/{deployment_id}",
+                      f"{base}/deployments/{deployment_id}",
                       method="DELETE"
                   )
 
-                  print(f"DELETED: {deployment_id}")
                   deleted += 1
+                  print(f"DELETED inactive deployment: {deployment_id}")
+
+                  time.sleep(0.2)
 
               except urllib.error.HTTPError as error:
+                  failed += 1
                   print(
-                      f"Could not delete {deployment_id}: "
+                      f"FAILED deployment {deployment_id}: "
                       f"HTTP {error.code}"
                   )
-                  skipped += 1
 
-          print("--------------------------------")
-          print(f"Total deleted: {deleted}")
-          print(f"Total skipped: {skipped}")
-          print(f"Latest successful kept: {keep_id}")
-          print("Deployment cleanup completed.")
+              except Exception as error:
+                  failed += 1
+                  print(f"ERROR {deployment_id}: {error}")
+
+          print("")
+          print("========== CLEANUP SUMMARY ==========")
+          print(f"Total found: {len(deployments)}")
+          print(f"Deleted: {deleted}")
+          print(f"Preserved: {preserved}")
+          print(f"Failed: {failed}")
+          print("=====================================")
           PY
